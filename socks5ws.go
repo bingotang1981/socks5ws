@@ -344,7 +344,7 @@ func readTcpRequest2TcpOnClient(uuid string) bool {
 			if conn, haskey := getConn(uuid); haskey && !conn.del {
 				// tcp中断 关闭所有连接 关过的就不用关了
 				if err.Error() != "EOF" {
-					log.Print(uuid, " tcp read err: ", err)
+					log.Print(uuid, " tcp request read err: ", err)
 				}
 				deleteConn(uuid)
 				return false
@@ -402,7 +402,7 @@ func readTcpReply2TcpOnClient(uuid string) bool {
 			if conn, haskey := getConn(uuid); haskey && !conn.del {
 				// tcp中断 关闭所有连接 关过的就不用关了
 				if err.Error() != "EOF" {
-					log.Print(uuid, " tcp read err: ", err)
+					log.Print(uuid, " tcp reply read err: ", err)
 				}
 				deleteConn(uuid)
 				return false
@@ -693,50 +693,50 @@ func runClient(tcpConn net.Conn, uuid string, wsAddr string, token string, enabl
 		// Read the version byte
 		version := []byte{0}
 		if _, err := bufConn.Read(version); err != nil {
-			fmt.Println("[ERR] socks: Failed to get version byte: ", err)
+			log.Print("[ERR] socks: Failed to get version byte: ", err)
 			return
 		}
 
 		// Ensure we are compatible
 		if version[0] != uint8(5) {
-			fmt.Println("Unsupported SOCKS version: ", version)
+			log.Print("Unsupported SOCKS version: ", version)
 			return
 		}
 
 		_, err := readMethods(bufConn)
 		if err != nil {
-			fmt.Println("[ERR] socks: Failed to get methods: ", err)
+			log.Print("[ERR] socks: Failed to get methods: ", err)
 			return
 		}
 
 		//Send the reply to the methond command from the client
 		t, err := sendMethodReply(tcpConn)
 		if err != nil {
-			fmt.Println("[ERR] socks: Failed to get methods: ", t, err)
+			log.Print("[ERR] socks: Failed to get methods: ", t, err)
 			return
 		}
 
 		// Read the version byte
 		header := []byte{0, 0, 0}
 		if _, err := io.ReadAtLeast(bufConn, header, 3); err != nil {
-			fmt.Println("[ERR] Failed to get command version: ", err)
+			log.Print("[ERR] Failed to get command version: ", err)
 			return
 		}
 
 		// Ensure we are compatible
 		if header[0] != uint8(5) {
-			fmt.Println("Unsupported command version: ", header[0])
+			log.Print("Unsupported command version: ", header[0])
 			return
 		}
 
 		//Support Connect command only
 		if header[1] != uint8(1) {
-			fmt.Println("Unsupported command: ", header[1])
+			log.Print("Unsupported command: ", header[1])
 
 			//Reply with unsupported command error
 			err1 := sendReply(tcpConn, uint8(7), nil)
 			if err1 != nil {
-				fmt.Println("SendReply error: ", err1)
+				log.Print("SendReply error: ", err1)
 			}
 			return
 		}
@@ -744,12 +744,12 @@ func runClient(tcpConn net.Conn, uuid string, wsAddr string, token string, enabl
 		// Read in the destination address
 		addrSpec, err := readAddrSpec(bufConn)
 		if err != nil {
-			fmt.Println("[ERR] Failed to get the AddrSpec")
+			log.Print("[ERR] Failed to get the AddrSpec")
 
 			//Reply with unsupported command error
 			err1 := sendReply(tcpConn, uint8(8), nil)
 			if err1 != nil {
-				fmt.Println("SendReply error: ", err1)
+				log.Print("SendReply error: ", err1)
 			}
 			return
 		}
@@ -765,7 +765,7 @@ func runClient(tcpConn net.Conn, uuid string, wsAddr string, token string, enabl
 		//Send success reply
 		err1 := sendReply(tcpConn, uint8(0), nil)
 		if err1 != nil {
-			fmt.Println("SendReply error: ", err1)
+			log.Print("SendReply error: ", err1)
 			return
 		}
 
@@ -777,7 +777,7 @@ func runClient(tcpConn net.Conn, uuid string, wsAddr string, token string, enabl
 			buf := make([]byte, 1024)
 			length, err := tcpConn.Read(buf)
 			if err != nil {
-				fmt.Println("[ERR] socks: Failed to read the content data: ", err)
+				log.Print("[ERR] socks: Failed to read the content data: ", err)
 				return
 			}
 
@@ -786,7 +786,6 @@ func runClient(tcpConn net.Conn, uuid string, wsAddr string, token string, enabl
 			//sniff http
 			hsniff, err1 := httpsniff.SniffHTTP(sbytes)
 			if err1 == nil {
-				// fmt.Println("Adjust http host: ", ipaddr, "->", hsniff.Domain())
 				ipaddr = hsniff.Domain()
 			} else {
 				//sniff tls
@@ -794,14 +793,13 @@ func runClient(tcpConn net.Conn, uuid string, wsAddr string, token string, enabl
 				if err2 == nil {
 					ipa := strings.Split(ipaddr, ":")
 					if len(ipa) == 1 {
-						fmt.Println("Fail to find the tls port: ", ipaddr, "->", tsniff.Domain())
+						log.Print("Fail to find the tls port: ", ipaddr, "->", tsniff.Domain())
 					} else {
-						// fmt.Println("Adjust tls host: ", ipaddr, "->", tsniff.Domain()+":"+ipa[1])
 						//append the port for the tls domain
 						ipaddr = tsniff.Domain() + ":" + ipa[1]
 					}
 				} else {
-					fmt.Println("Fail to sniff the host: ", ipaddr)
+					log.Print("Fail to sniff the host: ", ipaddr)
 				}
 			}
 		}
