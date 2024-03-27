@@ -8,6 +8,7 @@ Main features:
 
 1. Socks5 proxy with only connect command supported.
 2. Enable the sniff flag to adjust the host to counter the dns pollution. This feature is grabbed from *ray sniffing feature.
+3. Support the filter feature, which means that only the domains in the filter list will go through the server, otherwise, we will use the local connection.
 
 ## Command
 
@@ -30,3 +31,7 @@ Given this solution is compatible with our previous work stcp2ws (which is at ht
 `./socks5ws client https://aa.yourdomain.com 1080 yourCustomizedBearerToken s`
 
 You may find the last parameter is s.
+
+(3) Suppose you want to set up a client with the host sniffing feature and you also want to enable the fitler feature so that only the domains in the filter liste will go through the remote proxy. You may use the following command. We suppose your server is at https://aa.yourdomain.com, and your socks5 proxy listens at port 1080, and you have a filter file (filter.txt) in the same folder  of your application.
+
+`./socks5ws client https://aa.yourdomain.com 1080 yourCustomizedBearerToken s ./filter.txt`
