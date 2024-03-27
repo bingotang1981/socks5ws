@@ -16,7 +16,7 @@ import (
 	"os"
 	"os/signal"
 	"regexp"
-	"strconv" 
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -317,7 +317,7 @@ func readTcp2WsOnClient(uuid string, wsAddr string, token string, enableSniff bo
 }
 
 //This method forwards the tcp request to the local tcp channel
-func readTcpRequest2TcpOnClient(uuid string) {
+func readTcpRequest2TcpOnClient(uuid string) bool {
 	defer func() {
 		err := recover()
 		if err != nil {
@@ -327,25 +327,55 @@ func readTcpRequest2TcpOnClient(uuid string) {
 
 	conn, haskey := getConn(uuid)
 	if !haskey {
-		return
+		return false
 	}
-
+	buf := make([]byte, 500000)
 	tcpConn := conn.tcpConn
-	tcpConn2 := conn.tcpConn2
+	for {
+		if conn.del || tcpConn == nil {
+			return false
+		}
+		var length int
+		var err error
 
-	if conn.del || tcpConn == nil || tcpConn2 == nil {
-		return
-	}
+		length, err = tcpConn.Read(buf)
 
-	_, err := io.Copy(tcpConn2, tcpConn)
+		if err != nil {
+			if conn, haskey := getConn(uuid); haskey && !conn.del {
+				// tcp中断 关闭所有连接 关过的就不用关了
+				if err.Error() != "EOF" {
+					log.Print(uuid, " tcp read err: ", err)
+				}
+				deleteConn(uuid)
+				return false
+			}
+			return false
+		}
+		// log.Print(uuid, " ws send: ", length)
+		if length > 0 {
+			// 因为tcpConn.Read会阻塞 所以要从connMap中获取最新的wsConn
+			conn, haskey := getConn(uuid)
+			if !haskey || conn.del {
+				return false
+			}
 
-	if err != nil {
-		log.Print(uuid, " tcp request read err: ", err)
+			tcpConn2 := conn.tcpConn2
+			conn.t = time.Now().Unix()
+			if tcpConn2 == nil {
+				return false
+			}
+
+			if _, err = tcpConn2.Write(buf[:length]); err != nil {
+				log.Print(uuid, " tcp request write err: ", err)
+				tcpConn2.Close()
+				conn.tcpConn2 = nil
+			}
+		}
 	}
 }
 
 //This method forwards the tcp reply from the local channel to the request tcp
-func readTcpReply2TcpOnClient(uuid string) {
+func readTcpReply2TcpOnClient(uuid string) bool {
 	defer func() {
 		err := recover()
 		if err != nil {
@@ -355,24 +385,51 @@ func readTcpReply2TcpOnClient(uuid string) {
 
 	conn, haskey := getConn(uuid)
 	if !haskey {
-		return
+		return false
 	}
-
-	tcpConn := conn.tcpConn
+	buf := make([]byte, 500000)
 	tcpConn2 := conn.tcpConn2
+	for {
+		if conn.del || tcpConn2 == nil {
+			return false
+		}
+		var length int
+		var err error
 
-	if conn.del || tcpConn == nil || tcpConn2 == nil {
-		return
+		length, err = tcpConn2.Read(buf)
+
+		if err != nil {
+			if conn, haskey := getConn(uuid); haskey && !conn.del {
+				// tcp中断 关闭所有连接 关过的就不用关了
+				if err.Error() != "EOF" {
+					log.Print(uuid, " tcp read err: ", err)
+				}
+				deleteConn(uuid)
+				return false
+			}
+			return false
+		}
+		// log.Print(uuid, " ws send: ", length)
+		if length > 0 {
+			// 因为tcpConn.Read会阻塞 所以要从connMap中获取最新的wsConn
+			conn, haskey := getConn(uuid)
+			if !haskey || conn.del {
+				return false
+			}
+
+			tcpConn := conn.tcpConn
+			conn.t = time.Now().Unix()
+			if tcpConn == nil {
+				return false
+			}
+
+			if _, err = tcpConn.Write(buf[:length]); err != nil {
+				log.Print(uuid, " tcp reply write err: ", err)
+				tcpConn.Close()
+				conn.tcpConn = nil
+			}
+		}
 	}
-
-	_, err := io.Copy(tcpConn, tcpConn2)
-
-	if err != nil {
-		log.Print(uuid, " tcp reply read err: ", err)
-	}
-
-	//Only deleteConn in the reply func
-	deleteConn(uuid)
 }
 
 func readWs2TcpOnClient(uuid string) bool {
