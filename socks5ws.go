@@ -675,6 +675,7 @@ func runClient(tcpConn net.Conn, uuid string, wsAddr string, token string, enabl
 
 	var sbytes []byte
 	ipaddr := ""
+	inFilterList := false
 
 	// is reconnect
 	if tcpConn == nil {
@@ -755,6 +756,7 @@ func runClient(tcpConn net.Conn, uuid string, wsAddr string, token string, enabl
 		}
 
 		isip := false
+		sniffDomain := ""
 		if addrSpec.IP != nil {
 			isip = true
 			ipaddr = addrSpec.IP.String() + ":" + strconv.Itoa(addrSpec.Port)
@@ -786,7 +788,8 @@ func runClient(tcpConn net.Conn, uuid string, wsAddr string, token string, enabl
 			//sniff http
 			hsniff, err1 := httpsniff.SniffHTTP(sbytes)
 			if err1 == nil {
-				ipaddr = hsniff.Domain()
+				//sniff http success, get the domain
+				sniffDomain = hsniff.Domain()
 			} else {
 				//sniff tls
 				tsniff, err2 := tlssniff.SniffTLS(sbytes)
@@ -795,12 +798,34 @@ func runClient(tcpConn net.Conn, uuid string, wsAddr string, token string, enabl
 					if len(ipa) == 1 {
 						log.Print("Fail to find the tls port: ", ipaddr, "->", tsniff.Domain())
 					} else {
-						//append the port for the tls domain
-						ipaddr = tsniff.Domain() + ":" + ipa[1]
+						//sniff https success, get the domain
+						sniffDomain = tsniff.Domain() + ":" + ipa[1]
 					}
 				} else {
 					log.Print("Fail to sniff the host: ", ipaddr)
 				}
+			}
+		}
+
+		// Regarding ip address, iff Sniff is enabled, adjust the host name if filter is not enabled; ajust the host name in
+		// the filter list when filter is enabled to reduce the DNS resolution for the hosts not in the fitler lists
+		// Regarding the host name, no need to adjust it.
+		if isip {
+			if sniffDomain != "" {
+				if enableFilter {
+					if FastMatchDomain(sniffDomain) {
+						inFilterList = true
+						log.Print("adjust host ", ipaddr, "->", sniffDomain)
+						ipaddr = sniffDomain
+					}
+				} else {
+					log.Print("adjust host ", ipaddr, "->", sniffDomain)
+					ipaddr = sniffDomain
+				}
+			}
+		} else {
+			if enableFilter && FastMatchDomain(ipaddr) {
+				inFilterList = true
 			}
 		}
 
@@ -813,7 +838,7 @@ func runClient(tcpConn net.Conn, uuid string, wsAddr string, token string, enabl
 	//Support filter
 	if enableFilter {
 		//If in the fitler list, go through the proxy, or use the local dial
-		if FastMatchDomain(ipaddr) {
+		if inFilterList {
 			if dialNewWsOnClient(uuid, wsAddr, token, sbytes) {
 				// connect ok
 				go checkExistingWs2TcpOnClient(uuid, wsAddr, token, enableSniff, enableFilter)
