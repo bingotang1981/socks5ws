@@ -48,6 +48,7 @@ type AddrSpec struct {
 
 const (
 	HEART_BEAT_INTERVAL = 90
+	VERSION             = "0.3.0"
 	ipv4Address         = uint8(1)
 	fqdnAddress         = uint8(3)
 	ipv6Address         = uint8(4)
@@ -73,8 +74,8 @@ var upgrader = websocket.Upgrader{
 }
 
 func getConn(uuid string) (*tcp2wsSparkle, bool) {
-	connMapLock.RLock()
-	defer connMapLock.RUnlock()
+	connMapLock.Lock()
+	defer connMapLock.Unlock()
 	conn, haskey := connMap[uuid]
 	return conn, haskey
 }
@@ -86,27 +87,98 @@ func setConn(uuid string, conn *tcp2wsSparkle) {
 }
 
 func deleteConn(uuid string) {
-	if conn, haskey := getConn(uuid); haskey && conn != nil && !conn.del {
-		connMapLock.Lock()
-		defer connMapLock.Unlock()
-		conn.del = true
-		if conn.tcpConn != nil {
-			conn.tcpConn.Close()
-			conn.tcpConn = nil
-		}
-		if conn.tcpConn2 != nil {
-			log.Print(uuid, " bye")
-			conn.tcpConn2.Close()
-			conn.tcpConn2 = nil
-		}
-		if conn.wsConn != nil {
-			log.Print(uuid, " bye")
-			conn.wsConn.WriteMessage(websocket.TextMessage, []byte("tcp2wsSparkleClose"))
-			conn.wsConn.Close()
-			conn.wsConn = nil
+	connMapLock.Lock()
+	defer connMapLock.Unlock()
+	conn, haskey := connMap[uuid]
+
+	if haskey {
+		if conn != nil && !conn.del {
+			conn.del = true
+			if conn.tcpConn != nil {
+				conn.tcpConn.Close()
+				conn.tcpConn = nil
+			}
+			if conn.tcpConn2 != nil {
+				conn.tcpConn2.Close()
+				conn.tcpConn2 = nil
+			}
+			if conn.wsConn != nil {
+				log.Print(uuid, " bye")
+				conn.wsConn.WriteMessage(websocket.TextMessage, []byte("tcp2wsSparkleClose"))
+				conn.wsConn.Close()
+				conn.wsConn = nil
+			}
 		}
 		delete(connMap, uuid)
 	}
+}
+
+func deleteConnUponCloseMessage(uuid string) {
+	connMapLock.Lock()
+	defer connMapLock.Unlock()
+	conn, haskey := connMap[uuid]
+
+	if haskey {
+		if conn != nil && !conn.del {
+			conn.del = true
+
+			if conn.tcpConn != nil {
+				conn.tcpConn.Close()
+				conn.tcpConn = nil
+			}
+			if conn.tcpConn2 != nil {
+				conn.tcpConn2.Close()
+				conn.tcpConn2 = nil
+			}
+			if conn.wsConn != nil {
+				log.Print(uuid, " say bye")
+				conn.wsConn.Close()
+				conn.wsConn = nil
+			}
+		}
+
+		delete(connMap, uuid)
+	}
+}
+
+func monitorConnHeartbeat() {
+	connMapLock.Lock()
+	defer connMapLock.Unlock()
+
+	startTime := time.Now().Unix()
+	nowTimeCut := startTime - HEART_BEAT_INTERVAL
+	// check ws
+	for _, conn := range connMap {
+		// 如果超时没有收到消息，才发心跳，避免读写冲突
+		if conn.t < nowTimeCut {
+
+			wsConn := conn.wsConn
+			if wsConn == nil || wsConn.WriteMessage(websocket.TextMessage, []byte("tcp2wsSparkle")) != nil {
+				log.Print(conn.uuid, " tcp timeout close")
+				conn.del = true
+
+				if conn.tcpConn != nil {
+					conn.tcpConn.Close()
+					conn.tcpConn = nil
+				}
+				if conn.tcpConn2 != nil {
+					conn.tcpConn2.Close()
+					conn.tcpConn2 = nil
+				}
+				if conn.wsConn != nil {
+					log.Print(conn.uuid, " bye")
+					conn.wsConn.WriteMessage(websocket.TextMessage, []byte("tcp2wsSparkleClose"))
+					conn.wsConn.Close()
+					conn.wsConn = nil
+				}
+				delete(connMap, conn.uuid)
+			}
+
+		}
+	}
+
+	endTime := time.Now().Unix()
+	log.Print("Active cons: ", len(connMap), " (", endTime-startTime, "s)")
 }
 
 //dial a new tcp, only works in client mode
@@ -165,7 +237,7 @@ func dialNewWsOnClient(uuid string, wsAddr string, token string, sbytes []byte) 
 	}
 	// send uuid
 	if err := wsConn.WriteMessage(websocket.TextMessage, []byte(uuid)); err != nil {
-		log.Print("send ws uuid err: ", err)
+		log.Print("udp send ws uuid err: ", err)
 		wsConn.Close()
 		return false
 	}
@@ -185,28 +257,36 @@ func dialNewWsOnClient(uuid string, wsAddr string, token string, sbytes []byte) 
 		}
 		conn.wsConn = wsConn
 		conn.t = time.Now().Unix()
-		writeErrorBuf2Ws(conn)
+		// writeErrorBuf2Ws(conn)
 	}
 	return true
 }
 
-func readTcp2WsOnServer(uuid string) bool {
+//Server side: read Tcp to Ws connection
+//If Tcp errors are encountered, close the work
+//If Ws connection errors are met, wait for 10 seconds for the reovery of the ws connection
+func readTcp2WsOnServer(uuid string) {
 	defer func() {
 		err := recover()
 		if err != nil {
-			log.Print(uuid, " tcp -> ws on server Boom!\n", err)
+			log.Print(uuid, " server tcp -> ws Boom!\n", err)
 		}
 	}()
 
-	conn, haskey := getConn(uuid)
-	if !haskey {
-		return false
-	}
-	buf := make([]byte, 500000)
-	tcpConn := conn.tcpConn
+	//buffer as 32K
+	buf := make([]byte, 32768)
+
 	for {
+
+		conn, haskey := getConn(uuid)
+		if !haskey {
+			return
+		}
+
+		tcpConn := conn.tcpConn
+
 		if conn.del || tcpConn == nil {
-			return false
+			return
 		}
 		var length int
 		var err error
@@ -217,58 +297,112 @@ func readTcp2WsOnServer(uuid string) bool {
 			if conn, haskey := getConn(uuid); haskey && !conn.del {
 				// tcp中断 关闭所有连接 关过的就不用关了
 				if err.Error() != "EOF" {
+
 					log.Print(uuid, " tcp read err: ", err)
+
 				}
 				deleteConn(uuid)
-				return false
+				return
 			}
-			return false
+			return
 		}
+
 		// log.Print(uuid, " ws send: ", length)
 		if length > 0 {
 			// 因为tcpConn.Read会阻塞 所以要从connMap中获取最新的wsConn
 			conn, haskey := getConn(uuid)
 			if !haskey || conn.del {
-				return false
+				return
 			}
 			wsConn := conn.wsConn
 			conn.t = time.Now().Unix()
 
 			if wsConn == nil {
-				// 服务端退出等下次连上来
-				return false
-			}
-			if err = wsConn.WriteMessage(websocket.BinaryMessage, buf[:length]); err != nil {
-				log.Print(uuid, " ws write err: ", err)
-				// tcpConn.Close()
-				wsConn.Close()
-				saveErrorBuf(conn, buf, length)
+				rec := false
 
-				//Set wsConn to nil to avoid endless loop under extreme conditions
-				conn.wsConn = nil
+				//Wait for 10 seconds for the ws connection recovery
+				for i := 0; i < 10; i++ {
+					time.Sleep(1 * time.Second)
+					conn, haskey = getConn(uuid)
+					if !haskey || conn.del {
+						return
+					}
+
+					wsConn = conn.wsConn
+					conn.t = time.Now().Unix()
+
+					if wsConn != nil {
+						rec = true
+						break
+					}
+				}
+
+				if !rec {
+					log.Print(uuid, " fail to get the reconnected ws ")
+					deleteConn(uuid)
+				}
+			}
+
+			//Wait for 10 seconds for the ws connection recovery
+			suc := false
+			for i := 0; i < 10; i++ {
+				if wsConn == nil {
+					break
+				}
+
+				if err = wsConn.WriteMessage(websocket.BinaryMessage, buf[:length]); err != nil {
+					log.Print(uuid, " ws write err: ", err)
+					// tcpConn.Close()
+					wsConn.Close()
+
+					time.Sleep(1 * time.Second)
+
+					conn, haskey := getConn(uuid)
+					if !haskey || conn.del {
+						return
+					}
+
+					wsConn = conn.wsConn
+					conn.t = time.Now().Unix()
+
+				} else {
+					suc = true
+					break
+				}
+			}
+
+			if !suc {
+				log.Print(uuid, " fail to get the reconnected ws ")
+				deleteConn(uuid)
 			}
 		}
 	}
 }
 
-// 将tcp的数据转发到ws
-func readTcp2WsOnClient(uuid string, wsAddr string, token string, enableSniff bool, enableFilter bool) bool {
+//Client Side: read tcp to ws connection
+//If Tcp error, close the work
+//If ws connection error, wait 10 seconds for the ws connection recovery
+func readTcp2WsOnClient(uuid string) {
 	defer func() {
 		err := recover()
 		if err != nil {
-			log.Print(uuid, " tcp -> ws on client Boom!\n", err)
+			log.Print(uuid, " tcp -> ws Boom!\n", err)
+			// readTcp2Ws(uuid)
 		}
 	}()
 
-	conn, haskey := getConn(uuid)
-	if !haskey {
-		return false
-	}
-	buf := make([]byte, 500000)
-	tcpConn := conn.tcpConn
+	//Buffer 32K
+	buf := make([]byte, 32768)
+
 	for {
+		conn, haskey := getConn(uuid)
+		if !haskey {
+			return
+		}
+		tcpConn := conn.tcpConn
+
 		if conn.del || tcpConn == nil {
-			return false
+			return
 		}
 		var length int
 		var err error
@@ -282,35 +416,78 @@ func readTcp2WsOnClient(uuid string, wsAddr string, token string, enableSniff bo
 					log.Print(uuid, " tcp read err: ", err)
 				}
 				deleteConn(uuid)
-				return false
+				return
+			} else {
+				return
 			}
-			return false
 		}
 		// log.Print(uuid, " ws send: ", length)
 		if length > 0 {
 			// 因为tcpConn.Read会阻塞 所以要从connMap中获取最新的wsConn
 			conn, haskey := getConn(uuid)
 			if !haskey || conn.del {
-				return false
+				return
 			}
 			wsConn := conn.wsConn
 			conn.t = time.Now().Unix()
 
 			if wsConn == nil {
-				// 客户端 tcp上次重连没有成功 保存并重连 服务端不会设置成nil不会进这里
-				saveErrorBuf(conn, buf, length)
-				log.Print("try reconnect to ws ", uuid)
-				go runClient(nil, uuid, wsAddr, token, enableSniff, enableFilter)
-				continue
-			}
-			if err = wsConn.WriteMessage(websocket.BinaryMessage, buf[:length]); err != nil {
-				log.Print(uuid, " ws write err: ", err)
-				// tcpConn.Close()
-				wsConn.Close()
-				saveErrorBuf(conn, buf, length)
+				rec := false
 
-				//Set wsConn to nil to avoid endless loop under extreme conditions
-				conn.wsConn = nil
+				//Wait 10 seconds for the ws connection recovery
+				for i := 0; i < 10; i++ {
+					time.Sleep(1 * time.Second)
+					conn, haskey = getConn(uuid)
+					if !haskey || conn.del {
+						return
+					}
+
+					wsConn = conn.wsConn
+					conn.t = time.Now().Unix()
+
+					if wsConn != nil {
+						rec = true
+						break
+					}
+				}
+
+				if !rec {
+					log.Print(uuid, " fail to get the reconnected ws ")
+					deleteConn(uuid)
+				}
+			}
+
+			suc := false
+			for i := 0; i < 10; i++ {
+				if wsConn == nil {
+					break
+				}
+
+				//Wait 10 seconds for the ws connection recovery
+				if err = wsConn.WriteMessage(websocket.BinaryMessage, buf[:length]); err != nil {
+					log.Print(uuid, " ws write err: ", err)
+					// tcpConn.Close()
+					wsConn.Close()
+
+					time.Sleep(1 * time.Second)
+
+					conn, haskey := getConn(uuid)
+					if !haskey || conn.del {
+						return
+					}
+
+					wsConn = conn.wsConn
+					conn.t = time.Now().Unix()
+
+				} else {
+					suc = true
+					break
+				}
+			}
+
+			if !suc {
+				log.Print(uuid, " fail to get the reconnected ws ")
+				deleteConn(uuid)
 			}
 		}
 	}
@@ -432,34 +609,54 @@ func readTcpReply2TcpOnClient(uuid string) bool {
 	}
 }
 
-func readWs2TcpOnClient(uuid string) bool {
+//Client side: read the ws connection to the tcp
+//If Tcp errors, close the work
+//If ws connection error, make a ws reconnection. If successful, continue, otherwise, close the work
+func readWs2TcpOnClient(uuid string, wsAddr string, token string, sbytes []byte) {
 	defer func() {
 		err := recover()
 		if err != nil {
-			log.Print(uuid, " ws -> tcp on client Boom!\n", err)
+			log.Print(uuid, " client ws -> tcp Boom!\n", err)
 		}
 	}()
 
 	conn, haskey := getConn(uuid)
 	if !haskey {
-		return false
+		return
 	}
 	wsConn := conn.wsConn
 	tcpConn := conn.tcpConn
+
 	for {
 		if conn.del || tcpConn == nil || wsConn == nil {
-			return false
+			return
 		}
+
 		t, buf, err := wsConn.ReadMessage()
 		if err != nil || t == -1 {
 			wsConn.Close()
+
 			if conn, haskey := getConn(uuid); haskey && !conn.del {
 				// 外部干涉导致中断 重连ws
-				log.Print(uuid, " ws read err: ", err)
-				return true
+				log.Print(uuid, " client ws read err: ", err)
+				log.Print(uuid, " try to make a reconnection to ws")
+				//reconnect to ws
+				if dialNewWsOnClient(uuid, wsAddr, token, nil) {
+					//update the relevant handler after a successful reconnection
+					conn, haskey = getConn(uuid)
+					if !haskey {
+						return
+					}
+					wsConn = conn.wsConn
+					tcpConn = conn.tcpConn
+				} else {
+					log.Print(uuid, " fail to reconnect to ws")
+					deleteConn(uuid)
+					return
+				}
 			}
-			return false
 		}
+
 		// log.Print(uuid, " ws recv: ", len(buf))
 		if len(buf) > 0 {
 			conn.t = time.Now().Unix()
@@ -469,15 +666,8 @@ func readWs2TcpOnClient(uuid string) bool {
 					log.Print(uuid, " heartbeat")
 					continue
 				} else if msg == "tcp2wsSparkleClose" {
-					log.Print(uuid, " say bye")
-					connMapLock.Lock()
-					defer connMapLock.Unlock()
-					wsConn.Close()
-
-					tcpConn.Close()
-
-					delete(connMap, uuid)
-					return false
+					deleteConnUponCloseMessage(uuid)
+					return
 				} else {
 					log.Print(uuid, " unknown text message: "+msg)
 					continue
@@ -487,42 +677,45 @@ func readWs2TcpOnClient(uuid string) bool {
 			if _, err = tcpConn.Write(buf); err != nil {
 				log.Print(uuid, " tcp write err: ", err)
 				deleteConn(uuid)
-				return false
+				return
 			}
-
 		}
 	}
 }
 
-// 将ws的数据转发到tcp
-func readWs2TcpOnServer(uuid string) bool {
+//Servier Side: read the ws connection to the Tcp
+//If Tcp errors, close the work
+//If the ws conneciton error, close the work and if the ws connection recovery is
+//initialized from the client, a new thread will be created.
+func readWs2TcpOnServer(uuid string) {
 	defer func() {
 		err := recover()
 		if err != nil {
-			log.Print(uuid, " ws -> tcp on server Boom!\n", err)
+			log.Print(uuid, " server ws -> tcp Boom!\n", err)
 		}
 	}()
 
 	conn, haskey := getConn(uuid)
 	if !haskey {
-		return false
+		return
 	}
 	wsConn := conn.wsConn
 	tcpConn := conn.tcpConn
+
 	for {
 		if conn.del || tcpConn == nil || wsConn == nil {
-			return false
+			return
 		}
 		t, buf, err := wsConn.ReadMessage()
+
+		//If fail to read the ws message, return directly so that the thread is closed
+		//and then the client will try to do the reconnection.
 		if err != nil || t == -1 {
+			// log.Print(uuid, " fail to read the ws ", err)
 			wsConn.Close()
-			if conn, haskey := getConn(uuid); haskey && !conn.del {
-				// 外部干涉导致中断 重连ws
-				log.Print(uuid, " ws read err: ", err)
-				return true
-			}
-			return false
+			return
 		}
+
 		// log.Print(uuid, " ws recv: ", len(buf))
 		if len(buf) > 0 {
 			conn.t = time.Now().Unix()
@@ -532,15 +725,8 @@ func readWs2TcpOnServer(uuid string) bool {
 					log.Print(uuid, " heartbeat")
 					continue
 				} else if msg == "tcp2wsSparkleClose" {
-					log.Print(uuid, " say bye")
-					connMapLock.Lock()
-					defer connMapLock.Unlock()
-					wsConn.Close()
-
-					tcpConn.Close()
-
-					delete(connMap, uuid)
-					return false
+					deleteConnUponCloseMessage(uuid)
+					return
 				} else {
 					log.Print(uuid, " unknown text message: "+msg)
 					continue
@@ -550,48 +736,9 @@ func readWs2TcpOnServer(uuid string) bool {
 			if _, err = tcpConn.Write(buf); err != nil {
 				log.Print(uuid, " tcp write err: ", err)
 				deleteConn(uuid)
-				return false
+				return
 			}
 
-		}
-	}
-}
-
-// 多了一个被动断开后自动重连的功能
-func checkExistingWs2TcpOnClient(uuid string, wsAddr string, token string, enableSniff bool, enableFilter bool) {
-	if readWs2TcpOnClient(uuid) {
-		log.Print(uuid, " ws on client Boom!")
-		// error return  re call ws
-		conn, haskey := getConn(uuid)
-		if haskey {
-			// 删除wsConn
-			conn.wsConn = nil
-
-			// 现在重连
-			runClient(nil, uuid, wsAddr, token, enableSniff, enableFilter)
-		}
-	}
-}
-
-// 将没写成的内容写到ws
-func writeErrorBuf2Ws(conn *tcp2wsSparkle) {
-	if conn != nil {
-		for i := 0; i < len(conn.buf); i++ {
-			conn.wsConn.WriteMessage(websocket.BinaryMessage, conn.buf[i])
-		}
-		conn.buf = nil
-	}
-}
-
-// 拷贝当前发生失败内容并保存
-func saveErrorBuf(conn *tcp2wsSparkle, buf []byte, length int) {
-	if conn != nil {
-		tmp := make([]byte, length)
-		copy(tmp, buf[:length])
-		if conn.buf == nil {
-			conn.buf = [][]byte{tmp}
-		} else {
-			conn.buf = append(conn.buf, tmp)
 		}
 	}
 }
@@ -629,11 +776,12 @@ func runServer(wsConn *websocket.Conn) {
 			tcpConn = conn.tcpConn
 			conn.wsConn.Close()
 			conn.wsConn = wsConn
-			writeErrorBuf2Ws(conn)
 		}
 	}
 
-	if tcpConn == nil {
+	conn, haskey := getConn(uuid)
+
+	if !haskey {
 		// call new tcp
 		log.Print("new tcp for ", uuid)
 		us := strings.Split(uuid, " ")
@@ -658,7 +806,10 @@ func runServer(wsConn *websocket.Conn) {
 
 		go readTcp2WsOnServer(uuid)
 	} else {
-		log.Print("uuid finded ", uuid)
+		log.Print("uuid found ", uuid)
+
+		//update the wsConn with the new one
+		conn.wsConn = wsConn
 	}
 
 	go readWs2TcpOnServer(uuid)
@@ -677,163 +828,150 @@ func runClient(tcpConn net.Conn, uuid string, wsAddr string, token string, enabl
 	ipaddr := ""
 	inFilterList := false
 
-	// is reconnect
-	if tcpConn == nil {
-		// conn is close?
-		if conn, haskey := getConn(uuid); haskey {
-			if conn.del {
-				return
-			}
-		} else {
-			return
-		}
-	} else {
+	bufConn := bufio.NewReader(tcpConn)
 
-		bufConn := bufio.NewReader(tcpConn)
+	// Read the version byte
+	version := []byte{0}
+	if _, err := bufConn.Read(version); err != nil {
+		log.Print("[ERR] socks: Failed to get version byte: ", err)
+		return
+	}
 
-		// Read the version byte
-		version := []byte{0}
-		if _, err := bufConn.Read(version); err != nil {
-			log.Print("[ERR] socks: Failed to get version byte: ", err)
-			return
-		}
+	// Ensure we are compatible
+	if version[0] != uint8(5) {
+		log.Print("Unsupported SOCKS version: ", version)
+		return
+	}
 
-		// Ensure we are compatible
-		if version[0] != uint8(5) {
-			log.Print("Unsupported SOCKS version: ", version)
-			return
-		}
+	_, err := readMethods(bufConn)
+	if err != nil {
+		log.Print("[ERR] socks: Failed to get methods: ", err)
+		return
+	}
 
-		_, err := readMethods(bufConn)
-		if err != nil {
-			log.Print("[ERR] socks: Failed to get methods: ", err)
-			return
-		}
+	//Send the reply to the methond command from the client
+	t, err := sendMethodReply(tcpConn)
+	if err != nil {
+		log.Print("[ERR] socks: Failed to get methods: ", t, err)
+		return
+	}
 
-		//Send the reply to the methond command from the client
-		t, err := sendMethodReply(tcpConn)
-		if err != nil {
-			log.Print("[ERR] socks: Failed to get methods: ", t, err)
-			return
-		}
+	// Read the version byte
+	header := []byte{0, 0, 0}
+	if _, err := io.ReadAtLeast(bufConn, header, 3); err != nil {
+		log.Print("[ERR] Failed to get command version: ", err)
+		return
+	}
 
-		// Read the version byte
-		header := []byte{0, 0, 0}
-		if _, err := io.ReadAtLeast(bufConn, header, 3); err != nil {
-			log.Print("[ERR] Failed to get command version: ", err)
-			return
-		}
+	// Ensure we are compatible
+	if header[0] != uint8(5) {
+		log.Print("Unsupported command version: ", header[0])
+		return
+	}
 
-		// Ensure we are compatible
-		if header[0] != uint8(5) {
-			log.Print("Unsupported command version: ", header[0])
-			return
-		}
+	//Support Connect command only
+	if header[1] != uint8(1) {
+		log.Print("Unsupported command: ", header[1])
 
-		//Support Connect command only
-		if header[1] != uint8(1) {
-			log.Print("Unsupported command: ", header[1])
-
-			//Reply with unsupported command error
-			err1 := sendReply(tcpConn, uint8(7), nil)
-			if err1 != nil {
-				log.Print("SendReply error: ", err1)
-			}
-			return
-		}
-
-		// Read in the destination address
-		addrSpec, err := readAddrSpec(bufConn)
-		if err != nil {
-			log.Print("[ERR] Failed to get the AddrSpec")
-
-			//Reply with unsupported command error
-			err1 := sendReply(tcpConn, uint8(8), nil)
-			if err1 != nil {
-				log.Print("SendReply error: ", err1)
-			}
-			return
-		}
-
-		isip := false
-		sniffDomain := ""
-		if addrSpec.IP != nil {
-			isip = true
-			ipaddr = addrSpec.IP.String() + ":" + strconv.Itoa(addrSpec.Port)
-		} else {
-			ipaddr = addrSpec.FQDN + ":" + strconv.Itoa(addrSpec.Port)
-		}
-
-		//Send success reply
-		err1 := sendReply(tcpConn, uint8(0), nil)
+		//Reply with unsupported command error
+		err1 := sendReply(tcpConn, uint8(7), nil)
 		if err1 != nil {
 			log.Print("SendReply error: ", err1)
+		}
+		return
+	}
+
+	// Read in the destination address
+	addrSpec, err := readAddrSpec(bufConn)
+	if err != nil {
+		log.Print("[ERR] Failed to get the AddrSpec")
+
+		//Reply with unsupported command error
+		err1 := sendReply(tcpConn, uint8(8), nil)
+		if err1 != nil {
+			log.Print("SendReply error: ", err1)
+		}
+		return
+	}
+
+	isip := false
+	sniffDomain := ""
+	if addrSpec.IP != nil {
+		isip = true
+		ipaddr = addrSpec.IP.String() + ":" + strconv.Itoa(addrSpec.Port)
+	} else {
+		ipaddr = addrSpec.FQDN + ":" + strconv.Itoa(addrSpec.Port)
+	}
+
+	//Send success reply
+	err1 := sendReply(tcpConn, uint8(0), nil)
+	if err1 != nil {
+		log.Print("SendReply error: ", err1)
+		return
+	}
+
+	//Sniff for ip only but not domain name
+	//in socks5 proxy, it is possible to enforce the remote dns from the client,
+	//that's why we only sniff for ip.
+	if isip && enableSniff {
+		//Try to read some bytes to sniff
+		buf := make([]byte, 1024)
+		length, err := tcpConn.Read(buf)
+		if err != nil {
+			log.Print("[ERR] socks: Failed to read the content data: ", err)
 			return
 		}
 
-		//Sniff for ip only but not domain name
-		//in socks5 proxy, it is possible to enforce the remote dns from the client,
-		//that's why we only sniff for ip.
-		if isip && enableSniff {
-			//Try to read some bytes to sniff
-			buf := make([]byte, 1024)
-			length, err := tcpConn.Read(buf)
-			if err != nil {
-				log.Print("[ERR] socks: Failed to read the content data: ", err)
-				return
-			}
+		sbytes = buf[0:length]
 
-			sbytes = buf[0:length]
-
-			//sniff http
-			hsniff, err1 := httpsniff.SniffHTTP(sbytes)
-			if err1 == nil {
-				//sniff http success, get the domain
-				sniffDomain = hsniff.Domain()
-			} else {
-				//sniff tls
-				tsniff, err2 := tlssniff.SniffTLS(sbytes)
-				if err2 == nil {
-					ipa := strings.Split(ipaddr, ":")
-					if len(ipa) == 1 {
-						log.Print("Fail to find the tls port: ", ipaddr, "->", tsniff.Domain())
-					} else {
-						//sniff https success, get the domain
-						sniffDomain = tsniff.Domain() + ":" + ipa[1]
-					}
+		//sniff http
+		hsniff, err1 := httpsniff.SniffHTTP(sbytes)
+		if err1 == nil {
+			//sniff http success, get the domain
+			sniffDomain = hsniff.Domain()
+		} else {
+			//sniff tls
+			tsniff, err2 := tlssniff.SniffTLS(sbytes)
+			if err2 == nil {
+				ipa := strings.Split(ipaddr, ":")
+				if len(ipa) == 1 {
+					log.Print("Fail to find the tls port: ", ipaddr, "->", tsniff.Domain())
 				} else {
-					log.Print("Fail to sniff the host: ", ipaddr)
+					//sniff https success, get the domain
+					sniffDomain = tsniff.Domain() + ":" + ipa[1]
 				}
+			} else {
+				log.Print("Fail to sniff the host: ", ipaddr)
 			}
 		}
+	}
 
-		// Regarding ip address, iff Sniff is enabled, adjust the host name if filter is not enabled; ajust the host name in
-		// the filter list when filter is enabled to reduce the DNS resolution for the hosts not in the fitler lists
-		// Regarding the host name, no need to adjust it.
-		if isip {
-			if sniffDomain != "" {
-				if enableFilter {
-					if FastMatchDomain(sniffDomain) {
-						inFilterList = true
-						log.Print("adjust host ", ipaddr, "->", sniffDomain)
-						ipaddr = sniffDomain
-					}
-				} else {
+	// Regarding ip address, iff Sniff is enabled, adjust the host name if filter is not enabled; ajust the host name in
+	// the filter list when filter is enabled to reduce the DNS resolution for the hosts not in the fitler lists
+	// Regarding the host name, no need to adjust it.
+	if isip {
+		if sniffDomain != "" {
+			if enableFilter {
+				if FastMatchDomain(sniffDomain) {
+					inFilterList = true
 					log.Print("adjust host ", ipaddr, "->", sniffDomain)
 					ipaddr = sniffDomain
 				}
-			}
-		} else {
-			if enableFilter && FastMatchDomain(ipaddr) {
-				inFilterList = true
+			} else {
+				log.Print("adjust host ", ipaddr, "->", sniffDomain)
+				ipaddr = sniffDomain
 			}
 		}
-
-		uuid += " " + ipaddr
-
-		// save conn
-		setConn(uuid, &tcp2wsSparkle{tcpConn, nil, nil, uuid, false, nil, time.Now().Unix()})
+	} else {
+		if enableFilter && FastMatchDomain(ipaddr) {
+			inFilterList = true
+		}
 	}
+
+	uuid += " " + ipaddr
+
+	// save conn
+	setConn(uuid, &tcp2wsSparkle{tcpConn, nil, nil, uuid, false, nil, time.Now().Unix()})
 
 	//Support filter
 	if enableFilter {
@@ -841,12 +979,9 @@ func runClient(tcpConn net.Conn, uuid string, wsAddr string, token string, enabl
 		if inFilterList {
 			if dialNewWsOnClient(uuid, wsAddr, token, sbytes) {
 				// connect ok
-				go checkExistingWs2TcpOnClient(uuid, wsAddr, token, enableSniff, enableFilter)
+				go readWs2TcpOnClient(uuid, wsAddr, token, sbytes)
+				go readTcp2WsOnClient(uuid)
 
-				if tcpConn != nil {
-					// 不是重连
-					go readTcp2WsOnClient(uuid, wsAddr, token, enableSniff, enableFilter)
-				}
 			} else {
 				log.Print("reconnect to ws fail")
 			}
@@ -863,12 +998,8 @@ func runClient(tcpConn net.Conn, uuid string, wsAddr string, token string, enabl
 		//If not support filter, go through the proxy
 		if dialNewWsOnClient(uuid, wsAddr, token, sbytes) {
 			// connect ok
-			go checkExistingWs2TcpOnClient(uuid, wsAddr, token, enableSniff, enableFilter)
-
-			if tcpConn != nil {
-				// 不是重连
-				go readTcp2WsOnClient(uuid, wsAddr, token, enableSniff, enableFilter)
-			}
+			go readWs2TcpOnClient(uuid, wsAddr, token, sbytes)
+			go readTcp2WsOnClient(uuid)
 		} else {
 			log.Print("reconnect to ws fail")
 		}
@@ -1079,19 +1210,7 @@ func startServerThread(listenHostPort string, token string, isSsl bool, sslCrt s
 	for {
 		//heartbeat interval is 90 seconds as 100 seconds is the default timeout in cloudflare cdn
 		time.Sleep(HEART_BEAT_INTERVAL * time.Second)
-		nowTimeCut := time.Now().Unix() - HEART_BEAT_INTERVAL
-		// check ws
-		for k, i := range connMap {
-			// 如果超时没有收到消息，才发心跳，避免读写冲突
-			if i.t < nowTimeCut {
-				if err := i.wsConn.WriteMessage(websocket.TextMessage, []byte("tcp2wsSparkle")); err != nil {
-					log.Print(i.uuid, " tcp timeout close")
-					i.wsConn.Close()
-					deleteConn(k)
-				}
-			}
-		}
-		log.Print("Active cons: ", len(connMap))
+		monitorConnHeartbeat()
 	}
 }
 
@@ -1196,6 +1315,8 @@ func FastMatchDomain(domain string) bool {
 }
 
 func main() {
+	fmt.Println("socks5ws version: ", VERSION)
+
 	arg_num := len(os.Args)
 
 	if arg_num < 2 {
