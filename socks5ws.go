@@ -48,7 +48,7 @@ type AddrSpec struct {
 
 const (
 	HEART_BEAT_INTERVAL = 90
-	VERSION             = "0.3.0"
+	VERSION             = "0.3.1"
 	ipv4Address         = uint8(1)
 	fqdnAddress         = uint8(3)
 	ipv6Address         = uint8(4)
@@ -506,7 +506,7 @@ func readTcpRequest2TcpOnClient(uuid string) bool {
 	if !haskey {
 		return false
 	}
-	buf := make([]byte, 500000)
+	buf := make([]byte, 32768)
 	tcpConn := conn.tcpConn
 	for {
 		if conn.del || tcpConn == nil {
@@ -564,7 +564,7 @@ func readTcpReply2TcpOnClient(uuid string) bool {
 	if !haskey {
 		return false
 	}
-	buf := make([]byte, 500000)
+	buf := make([]byte, 32768)
 	tcpConn2 := conn.tcpConn2
 	for {
 		if conn.del || tcpConn2 == nil {
@@ -983,7 +983,8 @@ func runClient(tcpConn net.Conn, uuid string, wsAddr string, token string, enabl
 				go readTcp2WsOnClient(uuid)
 
 			} else {
-				log.Print("reconnect to ws fail")
+				log.Print("Connect to ws fail")
+				deleteConn(uuid)
 			}
 		} else {
 			if dialNewLocalTcpOnClient(uuid, sbytes) {
@@ -1001,7 +1002,8 @@ func runClient(tcpConn net.Conn, uuid string, wsAddr string, token string, enabl
 			go readWs2TcpOnClient(uuid, wsAddr, token, sbytes)
 			go readTcp2WsOnClient(uuid)
 		} else {
-			log.Print("reconnect to ws fail")
+			log.Print("Connect to ws fail")
+			deleteConn(uuid)
 		}
 	}
 }
